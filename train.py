@@ -13,7 +13,9 @@ import re
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
+from tokenizers import Tokenizer # ADDED
 
+# --- Configuration ---
 NUM_EPOCHS = 1
 BATCH_SIZE = 4
 GRADIENT_ACCUMULATION_STEPS = 4
@@ -36,10 +38,20 @@ MODEL_NAME = ""
 HF_REPO_ID = ""
 HF_TOKEN = ""
 
-USER_TOKEN_STR = "<|user|>\n"
-ASSISTANT_TOKEN_STR = "<|assistant|>\n"
-END_TOKEN_STR = "<|end|>\n"
-PAD_TOKEN_ID = 0
+# --- Tokenizer and Special Tokens ---
+TOKENIZER_FILE = "bpe-tokenizer.json" # ADDED: Path to our trained tokenizer
+
+# Load the tokenizer to get special tokens and vocab size
+if not os.path.exists(TOKENIZER_FILE):
+    raise FileNotFoundError(f"Tokenizer file not found at {TOKENIZER_FILE}. Please run train_tokenizer.py first.")
+tokenizer = Tokenizer.from_file(TOKENIZER_FILE) # ADDED
+
+# CHANGED: Get tokens and IDs from the tokenizer
+USER_TOKEN_STR = "<|user|>"
+ASSISTANT_TOKEN_STR = "<|assistant|>"
+END_TOKEN_STR = "<|end|>"
+PAD_TOKEN_ID = tokenizer.token_to_id("<|pad|>")
+VOCAB_SIZE = tokenizer.get_vocab_size()
 
 def setup_distributed(rank, world_size):
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
@@ -48,32 +60,33 @@ def setup_distributed(rank, world_size):
 def cleanup_distributed():
     dist.destroy_process_group()
 
-def decode_bytes(byte_seq):
-   return byte_seq.decode('utf-8', errors='replace')
+# REMOVED: decode_bytes function is no longer needed. We use tokenizer.decode()
 
 def calculate_perplexity(loss):
    return math.exp(loss) if isinstance(loss, float) else torch.exp(loss).item()
 
 def create_model():
    model = TransformerWrapper(
-       num_tokens=256,
+       num_tokens=VOCAB_SIZE, # CHANGED: Use the BPE vocab size
        max_seq_len=SEQ_LEN,
        num_memory_tokens=40,
        attn_layers=Decoder(
            dim=MODEL_DIM, depth=MODEL_DEPTH, heads=MODEL_HEADS,
            ff_no_bias=True, attn_flash=True, rotary_xpos=True, ff_glu=True, shift_tokens=1,
-           attn_qk_norm=True, attn_qk_norm_dim_scale=True, attn_qk_norm_scale=10, 
-           ff_dropout=0.1, attn_dropout=0.1, use_dynamic_tanh=True, dynamic_tanh_init_alpha=1.5, 
+           attn_qk_norm=True, attn_qk_norm_dim_scale=True, attn_qk_norm_scale=10,
+           ff_dropout=0.1, attn_dropout=0.1, use_dynamic_tanh=True, dynamic_tanh_init_alpha=1.5,
            num_residual_streams=1, integrate_layers=False
        )
    )
-   return AutoregressiveWrapper(model)
+   return AutoregressiveWrapper(model, pad_value=PAD_TOKEN_ID) # CHANGED: Inform the wrapper about the pad token ID
 
+# CHANGED: The entire Dataset class is updated to use the BPE tokenizer
 class JsonlConversationDataset(Dataset):
-    def __init__(self, file_path, seq_len, pad_token_id=0):
+    def __init__(self, file_path, tokenizer, seq_len):
         super().__init__()
         self.seq_len = seq_len
-        self.pad_token_id = pad_token_id
+        self.tokenizer = tokenizer
+        self.pad_token_id = self.tokenizer.token_to_id("<|pad|>")
         self.chunks = self._load_and_process_data(file_path)
 
     def _load_and_process_data(self, file_path):
@@ -88,11 +101,15 @@ class JsonlConversationDataset(Dataset):
                     role, content = turn.get('role'), turn.get('content', '')
                     if role == 'user': full_conversation_str += USER_TOKEN_STR + content + END_TOKEN_STR
                     elif role == 'assistant': full_conversation_str += ASSISTANT_TOKEN_STR + content + END_TOKEN_STR
-                conversation_bytes = full_conversation_str.encode('utf-8', errors='replace')
+
+                # Use the BPE tokenizer to encode the string into token IDs
+                token_ids = self.tokenizer.encode(full_conversation_str).ids
+
                 chunk_size = self.seq_len + 1
-                for i in range(0, len(conversation_bytes), chunk_size):
-                    chunk = list(conversation_bytes[i:i + chunk_size])
+                for i in range(0, len(token_ids), chunk_size):
+                    chunk = token_ids[i:i + chunk_size]
                     if len(chunk) < chunk_size:
+                        # Pad the last chunk if it's shorter
                         chunk.extend([self.pad_token_id] * (chunk_size - len(chunk)))
                     all_chunks.append(torch.tensor(chunk).long())
         print(f"Process {os.environ.get('RANK', 0)}: Finished processing. Found {len(all_chunks)} chunks.")
@@ -101,20 +118,26 @@ class JsonlConversationDataset(Dataset):
     def __len__(self): return len(self.chunks)
     def __getitem__(self, idx): return self.chunks[idx]
 
+# CHANGED: Generation now uses the BPE tokenizer for encoding and decoding
 def generate_sample(model, rank, length=GENERATE_LENGTH):
     model.eval()
     start_text = USER_TOKEN_STR + "I have leg pain." + END_TOKEN_STR + ASSISTANT_TOKEN_STR
-    start_bytes = start_text.encode('utf-8', errors='replace')
-    input_tensor = torch.tensor([list(start_bytes)]).to(rank).long()
     
+    # Encode the prompt using the tokenizer
+    input_ids = tokenizer.encode(start_text).ids
+    input_tensor = torch.tensor([input_ids]).to(rank).long()
+
     with autocast(device_type='cuda', dtype=torch.bfloat16):
-        generated_bytes = model.generate(input_tensor, length)
-    
-    full_sequence_bytes = generated_bytes[0].cpu().numpy()
-    full_generated_text = decode_bytes(full_sequence_bytes.tobytes())
-    
+        # The model generates token IDs
+        generated_ids = model.generate(input_tensor, length, eos_token=tokenizer.token_to_id(END_TOKEN_STR))
+
+    # Decode the full sequence of IDs back to a string
+    full_sequence_ids = generated_ids[0].cpu().tolist()
+    full_generated_text = tokenizer.decode(full_sequence_ids, skip_special_tokens=False)
+
+    # Extract just the response part
     response_only = full_generated_text[len(start_text):].split(END_TOKEN_STR)[0]
-    
+
     return f"--- PROMPT ---\n{start_text}\n--- RESPONSE ---\n{response_only}"
 
 def save_checkpoint(model, optimizer, global_step, epoch, batch_idx, save_path=CHECKPOINT_DIR):
@@ -134,6 +157,7 @@ def save_checkpoint(model, optimizer, global_step, epoch, batch_idx, save_path=C
     print(f"Saved checkpoint to {checkpoint_path}")
     return checkpoint_path
 
+# CHANGED: Save the tokenizer config along with the final model
 def save_final_model(model, save_dir=FINAL_MODEL_DIR):
     os.makedirs(save_dir, exist_ok=True)
     model_to_save = model.module if isinstance(model, DDP) else model
@@ -141,13 +165,18 @@ def save_final_model(model, save_dir=FINAL_MODEL_DIR):
     torch.save({
         'model_state_dict': model_to_save.state_dict(),
         'model_config': {
-            'num_tokens': 256, 'max_seq_len': SEQ_LEN, 'dim': MODEL_DIM,
+            'num_tokens': VOCAB_SIZE, 'max_seq_len': SEQ_LEN, 'dim': MODEL_DIM,
             'depth': MODEL_DEPTH, 'heads': MODEL_HEADS
         }
     }, model_path)
-    print(f"Final model saved to {save_dir}")
+    
+    # ADDED: Save the tokenizer file with the model for easy reloading/sharing
+    tokenizer.save(os.path.join(save_dir, 'tokenizer.json'))
+    
+    print(f"Final model and tokenizer saved to {save_dir}")
     return save_dir
 
+# ... (train function remains the same) ...
 def train(model, train_loader, val_loader, optimizer, rank, is_ddp, resume_from=None):
     total_batches = len(train_loader)
     global_step = 0
@@ -238,7 +267,7 @@ def main():
     if is_ddp:
         setup_distributed(rank, world_size)
 
-    data_path = '/kaggle/input/transformer-test/train3.jsonl' 
+    data_path = '/kaggle/input/transformer-test/train3.jsonl'
     if not os.path.exists(data_path):
         if rank == 0:
             print(f"Error: Data file not found at '{data_path}'. Please create it first.")
@@ -248,7 +277,8 @@ def main():
     model = model.to(rank)
 
     if rank == 0:
-        print(f"Model created. Number of parameters: {sum(p.numel() for p in model.parameters()):,}")
+        print(f"Model created with BPE tokenizer. Vocabulary size: {VOCAB_SIZE}") # CHANGED
+        print(f"Number of parameters: {sum(p.numel() for p in model.parameters()):,}")
         print(f"Training with micro-batch size: {BATCH_SIZE}")
         print(f"Gradient accumulation steps: {GRADIENT_ACCUMULATION_STEPS}")
         print(f"Effective batch size per step: {EFFECTIVE_BATCH_SIZE * world_size}")
@@ -256,7 +286,8 @@ def main():
     if is_ddp:
         model = DDP(model, device_ids=[rank], find_unused_parameters=False)
 
-    full_dataset = JsonlConversationDataset(data_path, SEQ_LEN, PAD_TOKEN_ID)
+    # CHANGED: Pass the tokenizer object to the dataset
+    full_dataset = JsonlConversationDataset(data_path, tokenizer, SEQ_LEN)
     if len(full_dataset) == 0:
         if rank == 0:
             print("Error: The dataset is empty. Check the data file and processing logic.")
@@ -265,7 +296,7 @@ def main():
     val_size = int(len(full_dataset) * VALIDATION_SPLIT)
     train_size = len(full_dataset) - val_size
     train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
-    
+
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True) if is_ddp else None
     val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False) if is_ddp else None
 
@@ -276,9 +307,9 @@ def main():
         print(f"Dataset split: {len(train_dataset)} training samples, {len(val_dataset)} validation samples.")
 
     optimizer = Lion(model.parameters(), lr=LEARNING_RATE, weight_decay=0.1)
-    
-    resume_from = '' 
-    
+
+    resume_from = ''
+
     global_step, total_batches = train(model, train_loader, val_loader, optimizer, rank, is_ddp, resume_from=resume_from)
 
     if rank == 0:
