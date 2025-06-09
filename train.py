@@ -87,31 +87,47 @@ class JsonlConversationDataset(Dataset):
         self.seq_len = seq_len
         self.tokenizer = tokenizer
         self.pad_token_id = self.tokenizer.token_to_id("<|pad|>")
+        if self.pad_token_id is None:
+            # Fallback if pad token isn't in the tokenizer for some reason
+            self.pad_token_id = 0
+            print("Warning: '<|pad|>' token not found. Using 0 for padding.")
         self.chunks = self._load_and_process_data(file_path)
 
     def _load_and_process_data(self, file_path):
         print(f"Process {os.environ.get('RANK', 0)}: Loading and processing data from {file_path}...")
         all_chunks = []
-        with open(file_path, 'r', encoding='utf-8') as f:
+        # Add errors='ignore' for robustness during file reading
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
             for line in f:
                 if not line.strip(): continue
-                conversation_turns = json.loads(line)
-                full_conversation_str = ""
-                for turn in conversation_turns:
-                    role, content = turn.get('role'), turn.get('content', '')
-                    if role == 'user': full_conversation_str += USER_TOKEN_STR + content + END_TOKEN_STR
-                    elif role == 'assistant': full_conversation_str += ASSISTANT_TOKEN_STR + content + END_TOKEN_STR
+                try:
+                    conversation_turns = json.loads(line)
+                    full_conversation_str = ""
+                    for turn in conversation_turns:
+                        role, content = turn.get('role'), turn.get('content', '')
 
-                # Use the BPE tokenizer to encode the string into token IDs
-                token_ids = self.tokenizer.encode(full_conversation_str).ids
+                        # --- THIS IS THE CRUCIAL FIX ---
+                        # Clean the string to remove invalid surrogate characters, just like in the tokenizer trainer
+                        if content:
+                            content = content.encode('utf-8', 'surrogatepass').decode('utf-8', 'replace')
+                        # -----------------------------
 
-                chunk_size = self.seq_len + 1
-                for i in range(0, len(token_ids), chunk_size):
-                    chunk = token_ids[i:i + chunk_size]
-                    if len(chunk) < chunk_size:
-                        # Pad the last chunk if it's shorter
-                        chunk.extend([self.pad_token_id] * (chunk_size - len(chunk)))
-                    all_chunks.append(torch.tensor(chunk).long())
+                        if role == 'user': full_conversation_str += USER_TOKEN_STR + content + END_TOKEN_STR
+                        elif role == 'assistant': full_conversation_str += ASSISTANT_TOKEN_STR + content + END_TOKEN_STR
+
+                    # Use the BPE tokenizer to encode the string into token IDs
+                    token_ids = self.tokenizer.encode(full_conversation_str).ids
+
+                    chunk_size = self.seq_len + 1
+                    for i in range(0, len(token_ids), chunk_size):
+                        chunk = token_ids[i:i + chunk_size]
+                        if len(chunk) < chunk_size:
+                            chunk.extend([self.pad_token_id] * (chunk_size - len(chunk)))
+                        all_chunks.append(torch.tensor(chunk).long())
+                except json.JSONDecodeError:
+                    print(f"Warning: Skipping malformed JSON line in process {os.environ.get('RANK', 0)}")
+                    continue
+
         print(f"Process {os.environ.get('RANK', 0)}: Finished processing. Found {len(all_chunks)} chunks.")
         return all_chunks
 
